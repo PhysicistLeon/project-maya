@@ -157,7 +157,8 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
                         // the batched MoE
                         2 * al(T * 8 * 8) + 2 * al(T * 8 * f4) + al(T * E * f4) + al(T * f4) +
                         al(T * ((size_t) FF / 32 * q8)) + al(T * E * f4) + al(T * 8 * ((size_t) g.n_ff_exp / 32 * q8)) +
-                        al(T * 8 * E * f4) + al(T * 8 * 8) + 3 * al((T * 8 + 1) * f4) + al(64) + al(T * 64);
+                        al(T * 8 * E * f4) + al(T * 8 * 8) + 3 * al((T * 8 + 1) * f4) + al(64) + al(T * 64) +
+                        (exl3_ ? al(T * 8 * (size_t) g.n_ff_exp * f4) : 0);
     if (cudaMalloc(&W.arena, need) != cudaSuccess) {
         cudaGetLastError();
         W.arena = nullptr;
@@ -215,6 +216,7 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
     W.n_groups = (int*) take_b(at, (T * 8 + 1) * f4);
     W.scr = (unsigned int*) take_b(at, 64);
     W.cpu_seq_w = (unsigned int*) take_b(at, T * 64);
+    if (exl3_) W.wh = take_f(at, T * 8 * (size_t) g.n_ff_exp);
     cudaMemset(W.cpu_seq_w, 0, T * 64);
     cudaMemset(W.mcpu_flag, 0, T * f4);
     if ((size_t) (at - (uint8_t*) W.arena) > need) {
@@ -378,7 +380,7 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         d.q_lora = g.q_lora;
         d.kv_raw = W.kv_raw + (size_t) t * g.kv_lora;
         d.kv_norm = Ly.kv_a_norm;
-        d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+        kv_prep_targets(kv_, il, (uint16_t*) (state_ + dsa_lat_[(size_t) il]), d);   // (KV streaming: + host copy)
         d.kv_lora = g.kv_lora;
         d.lat_q8 = lat_q8_;
         d.ik_raw = W.ik_raw + (size_t) t * g.idx_key;
@@ -432,9 +434,11 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
         gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
-        if (batched && gf::mla_attend(W.q_abs + (size_t) t * ad, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]),
-                                      F->cells, n_sel, g.n_head, g.qk_nope, g.kv_lora, W.ctx + (size_t) t * ad, s,
-                                      lat_q8_))
+        // KV streaming: this token's blocks resident before its attention (the next token's resolve runs after it)
+        uint16_t* const lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+        const int* cells = kv_attend_cells(kv_, il, lat, F->cells, n_sel, F->slot_cells, s);
+        if (batched && gf::mla_attend(W.q_abs + (size_t) t * ad, lat, cells, n_sel, g.n_head, g.qk_nope, g.kv_lora,
+                                      W.ctx + (size_t) t * ad, s, lat_q8_))
             continue;
         if (batched) {   // (the first token: the split attention is not available here - every token per token)
             batched = false;
@@ -443,8 +447,8 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
                 return false;
             }
         }
-        gf::mla(W.q + (size_t) t * qd, Ly.k_b, Ly.v_b, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), F->cells,
-                n_sel, g.n_head, g.qk_nope, g.kv_lora, g.v_head, (uint8_t*) W.attn_q + (size_t) t * W.aq_s, s, lat_q8_);
+        gf::mla(W.q + (size_t) t * qd, Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head, g.qk_nope, g.kv_lora, g.v_head,
+                (uint8_t*) W.attn_q + (size_t) t * W.aq_s, s, lat_q8_);
     }
     if (batched)
         gf::mla_out(W.ctx + (size_t) t0 * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, T,
@@ -509,6 +513,8 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         return a;
     };
     const bool lane = F->cpu_plan != 0ull && F->cpu_fmt[(size_t) il].n_ff > 0;
+    // STRATA_GLM_TRUNK_KEEP / _MAP: a window token leaves out the same experts the token path would (8: none)
+    const int keep = il == mtp_il_ ? 8 : glmfast::trunk_skip_from(il);
     static const int promote_min = [] {
         const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
         return v ? std::max(0, std::atoi(v)) : 0;
@@ -560,7 +566,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             gf::moe_route(W.rlog + (size_t) t * g.n_expert, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale,
                           g.norm_w != 0, il, W.x + (size_t) t * E, E, mt, W.sh_g + (size_t) t * FFs,
                           W.sh_u + (size_t) t * FFs, g.swiglu_shexp, FFs, (uint8_t*) W.sh_hq + (size_t) t * W.sh_hq_s, s,
-                          nullptr, nullptr, 0, nullptr, ah_bias, 0, 8, lane ? win_plan : 0ull, promote_min, 0, 0, t,
+                          nullptr, nullptr, 0, nullptr, ah_bias, 0, keep, lane ? win_plan : 0ull, promote_min, 0, 0, t,
                           scr, t0 + T);
             ++F->expected;
             gf::moe_wait(mt, E, s);
@@ -582,7 +588,49 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             if (!gf::mv(&jd, 1, s)) { err = "glm window: shared expert down"; return false; }
             sh_out = W.sh_out + (size_t) t0 * E;
         }
-        if (Ly.exl3) {
+        // EXL3: each distinct expert once for all its tokens (exl3::win_experts, gf::moe_win_experts' groups);
+        // STRATA_GLM_WIN_X3=0: each token's routed experts on the token path's kernels (A/B - the same bits)
+        static const bool x3_batch = [] {
+            const char* v = getenv("STRATA_GLM_WIN_X3");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (Ly.exl3 && x3_batch && W.wh != nullptr && x3::several_ok()) {
+            gf::MoeWin mw;
+            mw.plan_ptr = W.mplan_ptr + 8 * t0;
+            mw.grp_ptr = W.grp_ptr;
+            mw.grp_start = W.grp_start;
+            mw.grp_ent = W.grp_ent;
+            mw.n_groups = W.n_groups;
+            mw.T = T;
+            mw.k = g.n_exp_used;
+            gf::moe_win_group(mw, s);
+            x3::WinArgs xa;
+            xa.grp_ptr = W.grp_ptr;
+            xa.grp_start = W.grp_start;
+            xa.grp_ent = W.grp_ent;
+            xa.n_groups = W.n_groups;
+            xa.plan_ptr = W.mplan_ptr + 8 * t0;
+            xa.plan_w = W.mplan_w + 8 * t0;
+            xa.cpu_part = W.mcpu_part + (size_t) E * t0;
+            xa.cpu_flag = W.mcpu_flag + t0;
+            xa.x = W.x + (size_t) t0 * E;
+            xa.x_stride = (size_t) E;
+            xa.h = W.wh;
+            xa.part = W.wpart;
+            xa.sh_out = sh_out;
+            xa.out = W.ffn + (size_t) t0 * E;
+            xa.out_stride = (size_t) E;
+            xa.lay = Ly.xl;
+            xa.T = T;
+            xa.k = g.n_exp_used;
+            xa.n_embd = E;
+            xa.n_ff = g.n_ff_exp;
+            xa.limit = g.swiglu_exp;
+            if (!x3::win_experts(xa, s)) {
+                err = "glm window: the batched EXL3 experts";
+                return false;
+            }
+        } else if (Ly.exl3) {
             // EXL3: each token's routed experts on the token path's kernels (its own plan, F32 input and host part)
             for (int t = t0; t < t0 + T; ++t) {
                 const x3::MoeArgs xa = x3_args(tok_dev(t));
@@ -635,7 +683,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         float* ffn = W.ffn + (size_t) t * E;
         gf::moe_route(W.rlog + (size_t) t * g.n_expert, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale,
                       g.norm_w != 0, il, x, E, md, W.sh_g + (size_t) t * FFs, W.sh_u + (size_t) t * FFs,
-                      g.swiglu_shexp, FFs, F->sh_hq, s, nullptr, nullptr, 0, nullptr, ah_bias, 0, 8,
+                      g.swiglu_shexp, FFs, F->sh_hq, s, nullptr, nullptr, 0, nullptr, ah_bias, 0, keep,
                       lane ? F->cpu_plan : 0ull, promote_min);
         ++F->expected;
         gf::moe_wait(md, E, s);

@@ -23,6 +23,7 @@
 #endif
 #include "strata/kernels/glm_batch.hpp"
 #include "dsa_topk.cuh"
+#include "glm_lat8.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -65,22 +66,7 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
 __device__ __forceinline__ float lat_f(uint16_t v) { return __half2float(__ushort_as_half(v)); }
 __device__ __forceinline__ uint16_t lat_h(float v) { return __half_as_ushort(__float2half(v)); }
-// the INT8 latent records (STRATA_GLM_KV_INT8; glm_fast.hpp lat8_rec_bytes): kv codes, then an FP16 scale per 32
-__device__ __forceinline__ const uint8_t* lat8_rec(const uint16_t* lat, int kv, int cell) {
-    return (const uint8_t*) lat + (size_t) (kv + kv / 16) * cell;
-}
-// values [4 c4, 4 c4 + 4) of a record as FP16 (what an FP16 row's uint2 would hold)
-__device__ __forceinline__ uint2 lat8_h4(const uint8_t* rec, int kv, int c4) {
-    const char4 q = ((const char4*) rec)[c4];
-    const float d = __half2float(((const __half*) (rec + kv))[(4 * c4) >> 5]);
-    const __half2 a = __floats2half2_rn((float) q.x * d, (float) q.y * d);
-    const __half2 b = __floats2half2_rn((float) q.z * d, (float) q.w * d);
-    return make_uint2(*(const unsigned*) &a, *(const unsigned*) &b);
-}
-__device__ __forceinline__ uint4 lat8_h8(const uint8_t* rec, int kv, int c8) {
-    const uint2 lo = lat8_h4(rec, kv, 2 * c8), hi = lat8_h4(rec, kv, 2 * c8 + 1);
-    return make_uint4(lo.x, lo.y, hi.x, hi.y);
-}
+// the INT8 latent records as FP16: lat8_rec, lat8_h4, lat8_h8 (glm_lat8.cuh)
 __device__ __forceinline__ float dsigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
 std::atomic<int> g_errors{0};
@@ -452,6 +438,20 @@ __global__ void __launch_bounds__(128) kda_out_kernel(const float* __restrict__ 
 }
 
 // ---------------------------------------------------------------- DSA
+// value c of a latent row y into row `row` of a cache (FP16 rows, or INT8 records written by whole warps)
+__device__ __forceinline__ void lat_put(uint16_t* lat, int row, float y, bool q8, int kv_lora, int c) {
+    if (q8) {
+        uint8_t* rec = (uint8_t*) lat8_rec(lat, kv_lora, row);
+        float amax = fabsf(y);
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const __half d16 = __float2half(amax / 127.0f);
+        const float d = __half2float(d16);
+        ((int8_t*) rec)[c] = (int8_t) (d > 0.0f ? max(-127, min(127, __float2int_rn(y / d))) : 0);
+        if ((c & 31) == 0) ((__half*) (rec + kv_lora))[c >> 5] = d16;
+    } else {
+        lat[(size_t) kv_lora * row + c] = lat_h(y);
+    }
+}
 __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
     __shared__ float sred[32];
     const int t = blockIdx.x, role = blockIdx.y, tid = threadIdx.x;
@@ -482,16 +482,11 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
             const float y = v * inv * a.kv_norm[tid];
-            if (a.lat_q8) {
-                uint8_t* rec = (uint8_t*) lat8_rec(a.lat, a.kv_lora, p);
-                float amax = fabsf(y);
-                for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-                const __half d16 = __float2half(amax / 127.0f);
-                const float d = __half2float(d16);
-                ((int8_t*) rec)[tid] = (int8_t) (d > 0.0f ? max(-127, min(127, __float2int_rn(y / d))) : 0);
-                if ((tid & 31) == 0) ((__half*) (rec + a.kv_lora))[tid >> 5] = d16;
-            } else {
-                a.lat[(size_t) a.kv_lora * p + tid] = lat_h(y);
+            if (a.lat != nullptr) lat_put(a.lat, p, y, a.lat_q8, a.kv_lora, tid);
+            if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
+                lat_put(a.lat_host, p, y, a.lat_q8, a.kv_lora, tid);
+                const int sl = a.lat_table[p / a.lat_page];
+                if (sl >= 0) lat_put(a.lat_slots, sl * a.lat_page + p % a.lat_page, y, a.lat_q8, a.kv_lora, tid);
             }
         }
         return;

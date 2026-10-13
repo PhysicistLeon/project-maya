@@ -2439,6 +2439,13 @@ __device__ __forceinline__ void lat8_store_warp(float y, uint8_t* rec, int kv_lo
     ((int8_t*) rec)[c] = (int8_t) q;
     if (lane == 0) ((__half*) (rec + kv_lora))[c >> 5] = d16;
 }
+// value c of a latent row y into row `row` of a cache (FP16 rows, or INT8 records written by whole warps)
+__device__ __forceinline__ void lat_put(uint16_t* lat, int64_t row, float y, bool q8, int kv_lora, int c) {
+    if (q8)
+        lat8_store_warp(y, (uint8_t*) lat + (size_t) lat8_rec_bytes(kv_lora) * row, kv_lora, c, c & 31);
+    else
+        lat[(size_t) kv_lora * row + c] = lat_h(y);
+}
 // ---------------------------------------------------------------- DSA
 __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ DsaPrepArgs a) {
     __shared__ float sred[32];
@@ -2468,10 +2475,12 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ D
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
             const float y = v * inv * a.kv_norm[tid];
-            if (a.lat_q8)
-                lat8_store_warp(y, (uint8_t*) a.lat + (size_t) lat8_rec_bytes(a.kv_lora) * a.p, a.kv_lora, tid, tid & 31);
-            else
-                a.lat[(size_t) a.kv_lora * a.p + tid] = lat_h(y);
+            if (a.lat != nullptr) lat_put(a.lat, a.p, y, a.lat_q8, a.kv_lora, tid);
+            if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
+                lat_put(a.lat_host, a.p, y, a.lat_q8, a.kv_lora, tid);
+                const int sl = a.lat_table[a.p / a.lat_page];
+                if (sl >= 0) lat_put(a.lat_slots, (int64_t) sl * a.lat_page + a.p % a.lat_page, y, a.lat_q8, a.kv_lora, tid);
+            }
         }
         return;
     }
@@ -4052,8 +4061,9 @@ void mv_config(int r, int u, int wpb, int lds) {
 }  // namespace hip_expert_bench
 #endif
 
-// A batch's EXL3 jobs (w: an exl3::Mat) through exl3::mv, marked done: every column one EXL3 job, in launches of up to
-// exl3::kMaxMvJobs - nt > 0: nt activations one after another (mv_nt's layout), else each job's ncol at its strides
+// A batch's EXL3 jobs (w: an exl3::Mat) through exl3::mv, marked done, in launches of up to exl3::kMaxMvJobs - nt > 0:
+// nt activations one after another (mv_nt's layout), else each job's ncol at its strides; a job's activations (a
+// verify window's tokens) stay one EXL3 job of up to exl3::kMaxMvCols, its weights decoded once for several of them
 static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     exl3::MvJob xj[exl3::kMaxMvJobs];
     int nx = 0;
@@ -4064,7 +4074,7 @@ static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t
         const int64_t xq_cs = nt > 0 ? (int64_t) (j.n_in / 32) * (int64_t) sizeof(block_q8_1) : j.xq_cstride;
         const int64_t xf_cs = nt > 0 ? j.n_in : j.xf_cstride;
         const int64_t y_cs = nt > 0 ? j.n_out : j.y_cstride;
-        for (int c = 0; c < ncol; ++c) {
+        for (int c = 0; c < ncol; c += exl3::kMaxMvCols) {
             exl3::MvJob& x = xj[nx++];
             x.m = (const exl3::Mat*) j.w;
             x.xf = j.xf != nullptr ? j.xf + c * xf_cs : nullptr;
@@ -4072,6 +4082,10 @@ static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t
             x.y = j.y + c * y_cs;
             x.bias = j.bias;
             x.alpha = j.alpha;
+            x.ncol = std::min(exl3::kMaxMvCols, ncol - c);
+            x.xf_cs = (size_t) xf_cs;
+            x.xq_cs = (size_t) xq_cs;
+            x.y_cs = (size_t) y_cs;
             if (nx == exl3::kMaxMvJobs) {
                 if (!exl3::mv(xj, nx, s)) return false;
                 nx = 0;
@@ -4925,6 +4939,11 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
     moe_win_combine_kernel<<<dim3((unsigned) ((w.n_embd + 255) / 256), (unsigned) w.T), 256, 0, s>>>(w);
     launch_check("moe_win_experts");
     return true;
+}
+
+void moe_win_group(const MoeWin& w, cudaStream_t s) {
+    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+    launch_check("moe_win_group");
 }
 
 namespace {

@@ -4,6 +4,83 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.7 - 2026-10-13
+
+Faster prompts with the INT8 cache, Windows fixes for speed in the background and for the RAM tier, and a guard
+against model files that change after setup.
+
+- **Windows: full speed with Maya's window in the background.** The engine opts out of Windows' power throttling
+  (EcoQoS) itself, which moved its CPU lane onto a hybrid Intel CPU's efficiency cores whenever every Maya window was
+  in the background - decode dropped to a fraction of its focused speed (#114, thanks to @githug2024 for testing
+  `powercfg`).
+- **Windows: the RAM tier fills the pinning limit.** Where Windows refuses to pin a planned tier, the engine now
+  measures how much still pins and sizes the tier to it, instead of stepping down 3% at a time - those steps left a
+  128 GB PC's tier 2.5 GB under its limit, and the SSD served those experts (#129, measured by @anbow1). With several
+  expert sizes each takes its planned share. The log's "RAM tier sits on node X of N seen" line now appears only on
+  PCs with two NUMA nodes or more, where it means something (#114, #129, #147).
+- **A guard against model files that change after setup** (#155, traced by @zhanghuqqqq). Before the setup builds a pack from a Maya model's
+  files, it checks them against their published sha256 - files it downloaded were always checked, files already in the
+  folder now are too, once each. The pack records the files it was built from, and a start refuses it if they changed
+  afterwards (`./maya.sh --setup --repack` builds it again): a pack built while a download manager was still filling
+  files it had created at full size answered garbage.
+- **Prompts with the INT8 cache** (`--kv int8`). The prompt attention converts the cache's INT8 records to FP16 for
+  less (a byte permute and FP16 arithmetic instead of int-to-float conversions), with the same bits as before - checked
+  for every code and every scale on NVIDIA and AMD. On two V100s the attention's extra time over FP16 went from +18% to
+  +11%, and INT8 prompts are now within about 2% of FP16's (8K-32K).
+
+## v1.1.6 - 2026-10-13
+
+Long contexts with the attention's cache in RAM, EXL3 with the DFlash2 drafter up to twice as fast, and faster experts
+on the CPU and in prompts.
+
+- **KV streaming for long contexts** (#86 by @needmorevram). Each attention layer's cache can live in pinned RAM with a
+  window of it in VRAM (`--kv-streaming on`, `--kv-resident N`, 32,768 positions by default), so the VRAM it frees
+  holds experts. It pays off where the cache is large beside the cards: at 512K on an RTX 3090, 1,176 expert slots
+  instead of 714, prompts 4-9x faster and decode +5%; 1M context starts on one 3090; four conversations at 128K on two
+  GPUs (`--parallel 4`) decode 37% faster together. New setups turn it on; an existing config gets it from
+  `./maya.sh --setup` (Windows: `START-MAYA.bat --setup`). Decoding gives the same tokens as without it.
+- **EXL3 with the DFlash2 drafter decodes each weight once per window** (#164 by @needmorevram). A verify window
+  decoded every EXL3 weight once for each of its tokens; now once for all of them, with the same bits. On an RTX 3090 +
+  5060 Ti, DFlash2 with EXL3 decodes about twice as fast and is now 15-29% ahead of the MTP block (which itself gains
+  4-7%); on one RTX 3090 it is 13-30% faster than plain decode in chats.
+- **Faster CPU experts for IQ3 quants** (#166 by @needmorevram). The CPU lane's one-token IQ3_S / IQ3_XXS rows - all
+  of Maya-L's gate/up weights - decode 10-13% faster on a few cores, bit-identical to before (checked against ggml's
+  own dot at first use; `STRATA_GLM_CPU_1T=0` turns it off).
+- **Prompts: the experts' SwiGLU inside the MMQ product** (#166). On RTX 20 and newer, the prompt path's gate/up
+  product writes the SwiGLU directly instead of handing a buffer twice its size to a separate kernel: that step -17% on
+  an RTX 5060 Ti, -3.4% on an RTX 3090, the same values (`STRATA_GLM_MMQ_GLU=0` turns it off). It is applied to the
+  pinned ggml when the engine is built; without git (a source zip) the engine builds as before.
+- **Docs:** pages inherited from the code Maya grew out of, about other models, are gone; the README has five more
+  machines measured by users.
+
+## v1.1.5 - 2026-10-13
+
+Conversations that share their start read only what is new, safer serving for agents, faster CPU experts, and opt-in
+faster sampled answers on two GPUs.
+
+- **Conversation checkpoints** (#146 by @needmorevram). A prompt that shares its start with an earlier one - the same
+  system prompt and tools in another chat, or a chat whose last message was edited - now reads only what is new. The
+  conversation's state is kept in RAM (about 150 MB each, four by default) at the end of the system prompt, at the
+  start of the last turn and every 16K fresh tokens (`STRATA_GLM_CKPTS`, `STRATA_GLM_CKPT_EVERY`).
+- **Special tags in messages stay text** (#146). A user quoting `</think>`, a file an agent reads that holds
+  `<|user|>`, or a tool result printing `</tool_response>` no longer hands the model a real end of thinking, a new turn
+  or the end of the result. A tool set sent in another order keeps the order it was first seen in, so the conversation
+  is not read again from the system prompt.
+- **Request API** (#146): OpenAI's `logit_bias` (-100 bans a token); sampling fields sent as numeric strings are read,
+  and one that can't be read is a 400 naming the field; llama.cpp's `repeat_penalty` / `repeat_last_n`;
+  `GET /metrics/prometheus` with llama-server's metric names and Maya's own.
+- **Recovery and tuning** (#146): a conversation whose state turns non-finite is dropped and the request read again
+  from the start; the CPU lane's split is timed again during decode (`STRATA_GLM_CPU_RETIME`), so a start that timed
+  the CPU at a busy moment no longer keeps a skewed split; `STRATA_GLM_TRUNK_KEEP` applies in the DFlash2 windows too.
+- **CPU experts shared by several tokens are decoded once** (#154 by @needmorevram). A prompt's CPU experts and a
+  DFlash2 window's CPU pass read each weight row once for all the tokens that share it instead of once per token, with
+  results bit-identical to before (checked against ggml's own dot at first use; `STRATA_GLM_CPU_MT=0` turns it off).
+  Where the CPU computes a large share of the experts: decode +3.5-4.5% and prompts up to +15% on an RTX 3090 + RTX
+  5060 Ti with 2x Xeon. For prompts with images, the MTP block's cache now reads the image's rows, as the model does.
+- **Speculative sampling and cancelled wrong drafts for the two-GPU MTP decode** (#145 by @sociolog; opt-in:
+  `STRATA_GLM_SPEC_SAMPLE=1`, `STRATA_GLM_SPEC_CANCEL=1`). Sampled answers keep exactly the same distribution of
+  tokens and decode faster: +5% on an RTX 3090 + 3060.
+
 ## v1.1.4 - 2026-10-12
 
 The EXL3 quant works with the DFlash2 drafter, and on Windows + AMD a conversation taken back from a slot answers its
