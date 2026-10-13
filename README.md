@@ -76,6 +76,7 @@ Real machines, real numbers, most of them measured with `./maya.sh --bench`. A t
 | **3x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2690 v4, 62 GB RAM | Maya-S, 128K context | 26.6 tokens/s | 497 tokens/s | @saatvik-viniak (v1.1.11, #211) |
 | **4x RTX 3080 20 GB**, 64 GB DDR4 | Maya-M, 512K context | 26.3 tokens/s (a day of use) | - | @CoolJohn-lab (#104) |
 | **1x RTX 3090 24 GB** (power-capped at 225 W), Threadripper 3970X, 128 GB RAM | Maya-S24 | 26.0 tokens/s | 913 tokens/s | @briepala (v1.1.2, #135) |
+| **RTX 4090 24 GB** (PCIe 4.0 x16), Threadripper PRO 5975WX, 256 GiB DDR4, Windows 11 | Maya-L, 128K capacity, RAM-resident | 24.7 tokens/s | 349 tokens/s | [@PhysicistLeon](https://github.com/PhysicistLeon) (v1.1.4 before rebase, [#153](https://github.com/mw00/project-maya/pull/153)) |
 | **RTX PRO 4000 Blackwell 24 GB**, Core i9-13900K, 128 GB DDR5 | Maya-S24 | 24.7 tokens/s | 1146 tokens/s | @morrisfamily (v1.1.7, #174) |
 | **RTX 5090 32 GB** (PCIe 5.0 x16), Core i9-13900K, 64 GB RAM, Windows 11 | Maya-S, 128K context | 23.0 tokens/s | 2173 tokens/s | @gianbing (v1.1.3, #139) |
 | **4x Tesla T4 16 GB**, Xeon E5-2660 v2, 220 GB RAM | Maya-S | 22.6 tokens/s | 416 tokens/s | @ksanislo (v1.0.16, #36) |
@@ -84,6 +85,8 @@ Real machines, real numbers, most of them measured with `./maya.sh --bench`. A t
 | **RTX 3090 Ti 24 GB** (PCIe 3.0 x16, a VM), EPYC 7302P, 240 GB RAM | Maya-L, 32K context | 18.2 tokens/s (tuned, #177) | 791 tokens/s | @Jw88888 (v1.1.7, #177) |
 | **RTX 4090 24 GB**, Ryzen 9 9950X3D, 192 GB DDR5, Windows 11 | Maya-L, 128K context | 16.4 tokens/s | 1371 tokens/s | @npc97 (v1.0.24, #63) |
 | **RTX 5090 Laptop 24 GB**, Core Ultra 9 275HX, 64 GB RAM, Windows 11 (a laptop) | Maya-S24 | 14.5 tokens/s | 994 tokens/s | @klvnblst (v1.0.30, #67) |
+
+The Maya-L Windows numbers above were measured on the earlier v1.1.4-based PR build, not on its rebased version.
 
 Prefill is an 8K-token prompt. The speed holds as a conversation grows, and the first answers after a start are the
 slowest while the caches fill with what you use. Share yours: `--bench`, then `--report`, in a
