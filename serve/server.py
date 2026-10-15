@@ -48,6 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve import gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             effort_kwargs, effort_level, images_of, literal_tags, mark_literals,
                             openai_to_messages, unmark_literals)
@@ -429,8 +430,9 @@ class StrataEngine:
         self._tls = threading.local()                   # the request this thread is generating (pause())
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
         self.prefill_tok_s_mean = None
-        self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
+        self.progress = None             # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -442,6 +444,10 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith("VRAM "):
+                part = gpu_map.parse(line)
+                if part:
+                    self.vram.append(part)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -771,7 +777,13 @@ class StrataEngine:
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        # (read, total, reuse, ms): prompt progress, one per chunk: also a heartbeat (the
+                        # lines reset the 10 s wait, so without this a long prompt would send no keep-alives at all).
+                        # `reuse` (engines that print the field): what the conversation cache already held,
+                        # `ms` the prompt read's own clock - both go to the stream's prompt_progress
+                        self.progress = (int(f[1]), int(f[2]),
+                                         int(f[5]) if len(f) >= 6 and f[5].isdigit() else 0,
+                                         float(f[3]) if len(f) >= 4 else 0.0)
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
@@ -878,7 +890,9 @@ class StrataEngine:
                     yield int(f[2])
                 elif line.startswith("PP "):
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
-                        self.progress = (int(f[2]), int(f[3]))
+                        self.progress = (int(f[2]), int(f[3]),
+                                         int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
+                                         float(f[4]) if len(f) >= 5 else 0.0)
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
                     if cancel.is_set():
                         return
@@ -1598,7 +1612,7 @@ class Service:
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
-            live["prompt_read"], live["prompt_total"] = progress
+            live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context}
@@ -1612,10 +1626,26 @@ class Service:
             sh = list(getattr(self.engine, "stat_history", []) or [])
             tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in
                                               ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo")}}
-        return {"engine": engine, "live": live, "tiers": tiers, "requests": hist[::-1][:None if all_requests else 12],
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+        hw = dict(tel["now"])
+        cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
+        return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+                "requests": hist[::-1][:None if all_requests else 12],
+                "requests_kept": len(hist), "totals": totals, "hardware": hw,
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
+
+    def _gpu_map(self, cards):
+        """What fills each GPU (serve/gpu_map.py): the engine's VRAM lines and NVML's cards, with the engine's and the
+        vision encoder's processes told apart from other programs; None for an engine without VRAM lines."""
+        report = getattr(self.engine, "vram", None)
+        if not report:
+            return None
+        proc = getattr(self.engine, "proc", None)
+        v = self.vision
+        vproc = getattr(v, "proc", None) if v is not None else None
+        lent = v is not None and getattr(v, "lend", None) is not None and (vproc is not None or getattr(v, "owed", False))
+        return gpu_map.view(report, cards, proc.pid if proc is not None else None,
+                            vproc.pid if vproc is not None else None, lent)
 
     # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
@@ -2009,7 +2039,9 @@ class Service:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
-                            yield "ping", None
+                            pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
+                                            "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
                         n += 1
                         if my_first is None:
@@ -2303,8 +2335,15 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     json_mode = isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema")
     held = []
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
+        # ^ kind "ping": x carries the prompt's progress (total, cache, processed, time_ms) while the engine reads,
+        #   or None while this request just waits (queued again, an MCP round's engine work)
         if kind == "ping":
-            yield None
+            if req.get("return_progress") and req.get("stream") and isinstance(x, dict):
+                c = chunk({})
+                c["prompt_progress"] = x          # llama.cpp's field: the prompt read's progress, for a client's bar
+                yield c
+            else:
+                yield None
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x
@@ -2437,7 +2476,7 @@ def jobs_put(job: StreamJob) -> None:
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
     for c in chunks:
-        if c is None:                              # a heartbeat
+        if c is None or c.get("prompt_progress"):  # a heartbeat, a prompt-progress chunk: not answer content
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])

@@ -215,6 +215,10 @@ struct MoeDev {
                                                //     RAM-tier experts go to the host, the hot ones are promoted
     volatile int* route_error = nullptr;       // host-mapped, first invalid route: 4 * layer + kind (1..3)
     const int* skip = nullptr;                 // set_skip's flag: non-zero = the experts' kernels do nothing
+    // moe_experts_multi: mt_T tokens in one launch, token t's plan at plan_ptr / plan_w + 8 t and its rows at these
+    // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
+    int mt_T = 1;
+    unsigned int mt_xq_s = 0, mt_hq_s = 0, mt_sh_hq_s = 0, mt_out_s = 0, mt_cpu_s = 0;
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {
@@ -318,6 +322,13 @@ void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, floa
 /// down_off = the byte offset of the down rows inside an expert blob ([gate | up | down]).
 void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
               const float* sh_out, float* out, cudaStream_t s);
+/// moe_gate_up then moe_down for d.mt_T tokens in two launches (a verify window's tokens, each with its own plan and
+/// rows at d's mt_ strides): every token's arithmetic is its moe_gate_up / moe_down's, the blocks of all the tokens for
+/// a chunk of rows issued together - an expert two tokens route reads its rows once from DRAM.  AMD builds only (the
+/// token path's RDNA3 kernels); false: not here, nothing launched (the caller runs the tokens one by one).
+bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit,
+                       size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
+                       int n_ff_sh, float* sh_out, float* out, cudaStream_t s);
 
 /// The prompt path's LIGHTLY routed experts (a few rows each - MMQ's 64-128-token tiles would be mostly empty):
 /// light[3 i .. 3 i + 2] = {slot, r0, nr} (device): expert i is the blob at base + slot * stride, its rows are
@@ -338,7 +349,11 @@ void mtp_in(const float* emb, const float* h, const float* enorm, const float* h
 /// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 4096.
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
 
-/// argmax over n floats -> *out (device int).  Ties: lowest index.
-void argmax(const float* x, int n, int* out, cudaStream_t s);
+/// A chained draft's embedding: out = row *tok (a device int) of token_embd on the device (n_rows rows of type 14 =
+/// Q6_K or 8 = Q8_0), dequantized as ggml's to_float does (the same floats).  n_embd % 256 == 0.
+void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_embd, float* out, cudaStream_t s);
+/// argmax over n floats -> *out (device int).  Ties: lowest index.  map: an index i >= map_from is written as
+/// map[i - map_from] (a draft head's gathered rows -> their token ids).
+void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map = nullptr, int map_from = 0);
 
 }  // namespace strata::kernels::glmf
