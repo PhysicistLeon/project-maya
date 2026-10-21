@@ -1540,7 +1540,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         const bool balanced_ram = glmfast::balanced_resident_ram(balanced_env && std::atoi(balanced_env) != 0,
                                                                   F->ram_resident, staging_only);
         if (balanced_ram && n_parts_ != 1) {
-            err = "glm fast: STRATA_GLM_RAM_BALANCED currently requires one GPU";
+            err = "glm fast: MAYA_GLM_RAM_BALANCED currently requires one GPU";
             return false;
         }
         if (staging_only) {
